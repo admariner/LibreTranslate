@@ -1,4 +1,5 @@
 import io
+import math
 import os
 import re
 import tempfile
@@ -10,7 +11,7 @@ from timeit import default_timer
 
 import argostranslatefiles
 from argostranslatefiles import get_supported_formats
-from flask import Blueprint, Flask, Response, abort, jsonify, render_template, request, send_file, session, url_for
+from flask import Blueprint, Flask, Response, abort, jsonify, render_template, request, send_file, session, url_for, make_response
 from flask_babel import Babel
 from flask_session import Session
 from flask_swagger import swagger
@@ -89,21 +90,37 @@ def get_remote_address():
     return ip
 
 
-def get_req_limits(default_limit, api_keys_db, multiplier=1):
+def get_req_limits(default_limit, api_keys_db, db_multiplier=1, multiplier=1):
     req_limit = default_limit
 
     if api_keys_db:
         api_key = get_req_api_key()
 
         if api_key:
-            db_req_limit = api_keys_db.lookup(api_key)
-            if db_req_limit is not None:
-                req_limit = db_req_limit * multiplier
+            api_key_limits = api_keys_db.lookup(api_key)
+            if api_key_limits is not None:
+                req_limit = api_key_limits[0] * db_multiplier
 
-    return req_limit
+    return int(req_limit * multiplier)
 
 
-def get_routes_limits(default_req_limit, daily_req_limit, api_keys_db):
+def get_char_limit(default_limit, api_keys_db):
+    char_limit = default_limit
+
+    if api_keys_db:
+        api_key = get_req_api_key()
+
+        if api_key:
+            api_key_limits = api_keys_db.lookup(api_key)
+            if api_key_limits is not None:
+                if api_key_limits[1] is not None:
+                    char_limit = api_key_limits[1]
+
+    return char_limit
+
+
+def get_routes_limits(args, api_keys_db):
+    default_req_limit = args.req_limit
     if default_req_limit == -1:
         # TODO: better way?
         default_req_limit = 9999999999999
@@ -111,16 +128,30 @@ def get_routes_limits(default_req_limit, daily_req_limit, api_keys_db):
     def minute_limits():
         return "%s per minute" % get_req_limits(default_req_limit, api_keys_db)
 
+    def hourly_limits(n):
+        def func():
+          decay = (0.75 ** (n - 1))
+          return "{} per {} hour".format(get_req_limits(args.hourly_req_limit * n, api_keys_db, int(os.environ.get("LT_HOURLY_REQ_LIMIT_MULTIPLIER", 60) * n), decay), n)
+        return func
+
     def daily_limits():
-        return "%s per day" % get_req_limits(daily_req_limit, api_keys_db, 1440)
+        return "%s per day" % get_req_limits(args.daily_req_limit, api_keys_db, int(os.environ.get("LT_DAILY_REQ_LIMIT_MULTIPLIER", 1440)))
 
     res = [minute_limits]
 
-    if daily_req_limit > 0:
+    if args.hourly_req_limit > 0:
+      for n in range(1, args.hourly_req_limit_decay + 2):
+        res.append(hourly_limits(n))
+
+    if args.daily_req_limit > 0:
         res.append(daily_limits)
 
     return res
 
+def filter_unique(seq, extra):
+    seen = set({extra, ""})
+    seen_add = seen.add
+    return [x for x in seq if not (x in seen or seen_add(x))]
 
 def create_app(args):
     from libretranslate.init import boot
@@ -186,19 +217,29 @@ def create_app(args):
 
     api_keys_db = None
 
-    if args.req_limit > 0 or args.api_keys or args.daily_req_limit > 0:
+    if args.req_limit > 0 or args.api_keys or args.daily_req_limit > 0 or args.hourly_req_limit > 0:
         api_keys_db = None
         if args.api_keys:
             api_keys_db = RemoteDatabase(args.api_keys_remote) if args.api_keys_remote else Database(args.api_keys_db_path)
 
         from flask_limiter import Limiter
 
+        def limits_cost():
+          req_cost = getattr(request, 'req_cost', 1)
+          if args.req_time_cost > 0:
+            return max(req_cost, int(math.ceil(getattr(request, 'duration', 0) / args.req_time_cost)))
+          else:
+            return req_cost
+
         limiter = Limiter(
             key_func=get_remote_address,
             default_limits=get_routes_limits(
-                args.req_limit, args.daily_req_limit, api_keys_db
+                args, api_keys_db
             ),
             storage_uri=args.req_limit_storage,
+            default_limits_deduct_when=lambda req: True, # Force cost to be called after the request
+            default_limits_cost=limits_cost,
+            strategy="moving-window",
         )
     else:
         from .no_limiter import Limiter
@@ -266,11 +307,18 @@ def create_app(args):
                   ):
                     need_key = True
 
+                  req_secret = get_req_secret()
                   if (args.require_api_key_secret
                     and key_missing
-                    and not secret.secret_match(get_req_secret())
+                    and not secret.secret_match(req_secret)
                   ):
                     need_key = True
+                    if secret.secret_bogus_match(req_secret):
+                      abort(make_response(jsonify({
+                        'translatedText': secret.get_emoji(),
+                        'alternatives': [],
+                        'detectedLanguage': { 'confidence': 100, 'language': 'en' }
+                      }), 200))
 
                   if need_key:
                     description = _("Please contact the server operator to get an API key")
@@ -297,12 +345,19 @@ def create_app(args):
                 status = e.code
                 raise e
               finally:
-                duration = max(default_timer() - start_t, 0)
-                measure_request.labels(request.path, status, ip, ak).observe(duration)
+                request.duration = max(default_timer() - start_t, 0)
+                measure_request.labels(request.path, status, ip, ak).observe(request.duration)
                 g.dec()
           return measure_func
         else:
-          return func
+          @wraps(func)
+          def time_func(*a, **kw):
+            start_t = default_timer()
+            try:
+              return func(*a, **kw)
+            finally:
+              request.duration = max(default_timer() - start_t, 0)
+          return time_func
 
     @bp.errorhandler(400)
     def invalid_api(e):
@@ -331,7 +386,7 @@ def create_app(args):
         if langcode and langcode in get_available_locale_codes(not args.debug):
             session.update(preferred_lang=langcode)
 
-        return render_template(
+        resp = make_response(render_template(
             "index.html",
             gaId=args.ga_id,
             frontendTimeout=args.frontend_timeout,
@@ -343,18 +398,34 @@ def create_app(args):
             available_locales=[{'code': l['code'], 'name': _lazy(l['name'])} for l in get_available_locales(not args.debug)],
             current_locale=get_locale(),
             alternate_locales=get_alternate_locale_links()
-        )
+        ))
+
+        if args.require_api_key_secret:
+          resp.set_cookie('r', '1')
+
+        return resp
 
     @bp.route("/js/app.js")
     @limiter.exempt
     def appjs():
       if args.disable_web_ui:
-            abort(404)
+        abort(404)
 
+      api_secret = ""
+      bogus_api_secret = ""
+      if args.require_api_key_secret:
+        bogus_api_secret = secret.get_bogus_secret_b64()
+
+        if 'User-Agent' in request.headers and request.cookies.get('r'):
+          api_secret = secret.get_current_secret_js()
+        else:
+          api_secret = secret.get_bogus_secret_js()
+        
       response = Response(render_template("app.js.template",
             url_prefix=args.url_prefix,
             get_api_key_link=args.get_api_key_link,
-            api_secret=secret.get_current_secret() if args.require_api_key_secret else ""), content_type='application/javascript; charset=utf-8')
+            api_secret=api_secret,
+            bogus_api_secret=bogus_api_secret), content_type='application/javascript; charset=utf-8')
 
       if args.require_api_key_secret:
         response.headers['Last-Modified'] = http_date(datetime.now())
@@ -454,6 +525,14 @@ def create_app(args):
                * `text` - Plain text
                * `html` - HTML markup
           - in: formData
+            name: alternatives
+            schema:
+              type: integer
+              default: 0
+              example: 3
+            required: false
+            description: Preferred number of alternative translations 
+          - in: formData
             name: api_key
             schema:
               type: string
@@ -515,11 +594,13 @@ def create_app(args):
             source_lang = json.get("source")
             target_lang = json.get("target")
             text_format = json.get("format")
+            num_alternatives = int(json.get("alternatives", 0))
         else:
             q = request.values.get("q")
             source_lang = request.values.get("source")
             target_lang = request.values.get("target")
             text_format = request.values.get("format")
+            num_alternatives = request.values.get("alternatives", 0)
 
         if not q:
             abort(400, description=_("Invalid request: missing %(name)s parameter", name='q'))
@@ -527,12 +608,22 @@ def create_app(args):
             abort(400, description=_("Invalid request: missing %(name)s parameter", name='source'))
         if not target_lang:
             abort(400, description=_("Invalid request: missing %(name)s parameter", name='target'))
+        
+        try:
+            num_alternatives = max(0, int(num_alternatives))
+        except ValueError:
+            abort(400, description=_("Invalid request: %(name)s parameter is not a number", name='alternatives'))
+
+        if args.alternatives_limit != -1 and num_alternatives > args.alternatives_limit:
+            abort(400, description=_("Invalid request: %(name)s parameter must be <= %(value)s", name='alternatives', value=args.alternatives_limit))
 
         if not request.is_json:
             # Normalize line endings to UNIX style (LF) only so we can consistently
             # enforce character limits.
             # https://www.rfc-editor.org/rfc/rfc2046#section-4.1.1
             q = "\n".join(q.splitlines())
+
+        char_limit = get_char_limit(args.char_limit, api_keys_db)
 
         batch = isinstance(q, list)
 
@@ -544,29 +635,29 @@ def create_app(args):
                     description=_("Invalid request: request (%(size)s) exceeds text limit (%(limit)s)", size=batch_size, limit=args.batch_limit),
                 )
 
-        if args.char_limit != -1:
-            chars = sum([len(text) for text in q]) if batch else len(q)
+        src_texts = q if batch else [q]
 
-            if args.char_limit < chars:
-                abort(
-                    400,
-                    description=_("Invalid request: request (%(size)s) exceeds text limit (%(limit)s)", size=chars, limit=args.char_limit),
-                )
+        if char_limit != -1:
+            for text in src_texts:
+                if len(text) > char_limit:
+                    abort(
+                        400,
+                        description=_("Invalid request: request (%(size)s) exceeds text limit (%(limit)s)", size=len(text), limit=char_limit),
+                    )
+
+        if batch:
+            request.req_cost = max(1, len(q))
 
         if source_lang == "auto":
-            candidate_langs = detect_languages(q if batch else [q])
-            source_langs = [candidate_langs[0]]
+            candidate_langs = detect_languages(src_texts)
+            detected_src_lang = candidate_langs[0]
         else:
-            if batch:
-                source_langs = [ {"confidence": 100.0, "language": source_lang} for text in q]
-            else:
-                source_langs = [ {"confidence": 100.0, "language": source_lang} ]
+            detected_src_lang = {"confidence": 100.0, "language": source_lang}
 
-        src_langs = [next(iter([l for l in languages if l.code == source_lang["language"]]), None) for source_lang in source_langs]
+        src_lang = next(iter([l for l in languages if l.code == detected_src_lang["language"]]), None)
 
-        for idx, lang in enumerate(src_langs):
-            if lang is None:
-                abort(400, description=_("%(lang)s is not supported", lang=source_langs[idx]))
+        if src_lang is None:
+            abort(400, description=_("%(lang)s is not supported", lang=source_lang))
 
         tgt_lang = next(iter([l for l in languages if l.code == target_lang]), None)
 
@@ -581,54 +672,53 @@ def create_app(args):
 
         try:
             if batch:
-                results = []
-                for idx, text in enumerate(q):
-                    translator = src_langs[idx].get_translation(tgt_lang)
+                batch_results = []
+                batch_alternatives = []
+                for text in q:
+                    translator = src_lang.get_translation(tgt_lang)
                     if translator is None:
-                        abort(400, description=_("%(tname)s (%(tcode)s) is not available as a target language from %(sname)s (%(scode)s)", tname=_lazy(tgt_lang.name), tcode=tgt_lang.code, sname=_lazy(src_langs[idx].name), scode=src_langs[idx].code))
+                        abort(400, description=_("%(tname)s (%(tcode)s) is not available as a target language from %(sname)s (%(scode)s)", tname=_lazy(tgt_lang.name), tcode=tgt_lang.code, sname=_lazy(src_lang.name), scode=src_lang.code))
 
                     if text_format == "html":
-                        translated_text = str(translate_html(translator, text))
+                        translated_text = unescape(str(translate_html(translator, text)))
+                        alternatives = [] # Not supported for html yet
                     else:
-                        translated_text = improve_translation_formatting(text, translator.translate(text))
+                        hypotheses = translator.hypotheses(text, num_alternatives + 1)
+                        translated_text = unescape(improve_translation_formatting(text, hypotheses[0].value))
+                        alternatives = filter_unique([unescape(improve_translation_formatting(text, hypotheses[i].value)) for i in range(1, len(hypotheses))], translated_text)
 
-                    results.append(unescape(translated_text))
+                    batch_results.append(translated_text)
+                    batch_alternatives.append(alternatives)
+                
+                result = {"translatedText": batch_results}
+
                 if source_lang == "auto":
-                    return jsonify(
-                        {
-                            "translatedText": results,
-                            "detectedLanguage": source_langs
-                        }
-                    )
-                else:
-                    return jsonify(
-                          {
-                            "translatedText": results
-                          }
-                    )
+                    result["detectedLanguage"] = [detected_src_lang] * len(q)
+                if num_alternatives > 0:
+                    result["alternatives"] = batch_alternatives
+
+                return jsonify(result)
             else:
-                translator = src_langs[0].get_translation(tgt_lang)
+                translator = src_lang.get_translation(tgt_lang)
                 if translator is None:
-                    abort(400, description=_("%(tname)s (%(tcode)s) is not available as a target language from %(sname)s (%(scode)s)", tname=_lazy(tgt_lang.name), tcode=tgt_lang.code, sname=_lazy(src_langs[0].name), scode=src_langs[0].code))
+                    abort(400, description=_("%(tname)s (%(tcode)s) is not available as a target language from %(sname)s (%(scode)s)", tname=_lazy(tgt_lang.name), tcode=tgt_lang.code, sname=_lazy(src_lang.name), scode=src_lang.code))
 
                 if text_format == "html":
-                    translated_text = str(translate_html(translator, q))
+                    translated_text = unescape(str(translate_html(translator, q)))
+                    alternatives = [] # Not supported for html yet
                 else:
-                    translated_text = improve_translation_formatting(q, translator.translate(q))
+                    hypotheses = translator.hypotheses(q, num_alternatives + 1)
+                    translated_text = unescape(improve_translation_formatting(q, hypotheses[0].value))
+                    alternatives = filter_unique([unescape(improve_translation_formatting(q, hypotheses[i].value)) for i in range(1, len(hypotheses))], translated_text)
+
+                result = {"translatedText": translated_text}
 
                 if source_lang == "auto":
-                    return jsonify(
-                        {
-                            "translatedText": unescape(translated_text),
-                            "detectedLanguage": source_langs[0]
-                        }
-                    )
-                else:
-                    return jsonify(
-                        {
-                            "translatedText": unescape(translated_text)
-                        }
-                    )
+                    result["detectedLanguage"] = detected_src_lang
+                if num_alternatives > 0:
+                    result["alternatives"] = alternatives
+
+                return jsonify(result)
         except Exception as e:
             raise e
             abort(500, description=_("Cannot translate text: %(text)s", text=str(e)))
@@ -723,6 +813,7 @@ def create_app(args):
         source_lang = request.form.get("source")
         target_lang = request.form.get("target")
         file = request.files['file']
+        char_limit = get_char_limit(args.char_limit, api_keys_db)
 
         if not file:
             abort(400, description=_("Invalid request: missing %(name)s parameter", name='file'))
@@ -737,12 +828,10 @@ def create_app(args):
         if os.path.splitext(file.filename)[1] not in frontend_argos_supported_files_format:
             abort(400, description=_("Invalid request: file format not supported"))
 
-        source_langs = [source_lang]
-        src_langs = [next(iter([l for l in languages if l.code == source_lang]), None) for source_lang in source_langs]
+        src_lang = next(iter([l for l in languages if l.code == source_lang]), None)
 
-        for idx, lang in enumerate(src_langs):
-            if lang is None:
-                abort(400, description=_("%(lang)s is not supported", lang=source_langs[idx]))
+        if src_lang is None and source_lang != "auto":
+            abort(400, description=_("%(lang)s is not supported", lang=source_lang))
 
         tgt_lang = next(iter([l for l in languages if l.code == target_lang]), None)
 
@@ -755,7 +844,23 @@ def create_app(args):
 
             file.save(filepath)
 
-            translated_file_path = argostranslatefiles.translate_file(src_langs[0].get_translation(tgt_lang), filepath)
+            # Not an exact science: take the number of bytes and divide by
+            # the character limit. Assuming a plain text file, this will
+            # set the cost of the request to N = bytes / char_limit, which is
+            # roughly equivalent to a batch process of N batches assuming
+            # each batch uses all available limits
+            if char_limit > 0:
+                request.req_cost = max(1, int(os.path.getsize(filepath) / char_limit))
+
+            if source_lang == "auto":
+                src_texts = argostranslatefiles.get_texts(filepath)
+                candidate_langs = detect_languages(src_texts)
+                detected_src_lang = candidate_langs[0]
+                src_lang = next(iter([l for l in languages if l.code == detected_src_lang["language"]]), None)
+                if src_lang is None:
+                    abort(400, description=_("%(lang)s is not supported", lang=detected_src_lang["language"]))
+
+            translated_file_path = argostranslatefiles.translate_file(src_lang.get_translation(tgt_lang), filepath)
             translated_filename = os.path.basename(translated_file_path)
 
             return jsonify(
@@ -806,7 +911,7 @@ def create_app(args):
             name: q
             schema:
               type: string
-              example: Hello world!
+              example: What language is this?
             required: true
             description: Text to detect
           - in: formData
@@ -827,11 +932,11 @@ def create_app(args):
                 properties:
                   confidence:
                     type: number
-                    format: float
+                    format: integer
                     minimum: 0
-                    maximum: 1
+                    maximum: 100
                     description: Confidence value
-                    example: 0.6
+                    example: 100
                   language:
                     type: string
                     description: Language code
