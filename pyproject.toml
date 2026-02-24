@@ -39,6 +39,7 @@ dependencies = [
     "argos-translate-lt ==1.12.1",
     "Flask ==2.2.5",
     "flask-swagger ==0.2.14",
+    "beautifulsoup4 ==4.9.3,
     "flask-swagger-ui ==4.11.1",
     "Flask-Limiter ==2.6.3",
     "Flask-Babel ==3.1.0",
