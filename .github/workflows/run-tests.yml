@@ -31,6 +31,7 @@ jobs:
     - name: Install dependencies
       run: |
         pipx install hatch
+        pipx inject hatch "virtualenv<20.29.0" --force
         hatch run locales
 
     - name: Test with pytest
