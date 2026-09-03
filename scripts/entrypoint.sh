@@ -52,6 +52,7 @@ fi
 if [[ -z "$ARGOS_CHUNK_TYPE" ]]; then
     export ARGOS_CHUNK_TYPE=MINISBD
 fi
+export OMP_NUM_THREADS=1
 
 ./venv/bin/gunicorn -c scripts/gunicorn_conf.py --workers $LT_THREADS --max-requests 250 --timeout ${LT_TIMEOUT:-2400} --bind $BIND_ADDR:$LT_PORT 'wsgi:app()'
 
